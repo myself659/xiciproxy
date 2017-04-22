@@ -3,6 +3,7 @@ package xiciproxy
 import (
 	"database/sql"
 	"fmt"
+	"github.com/deckarep/golang-set"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/parnurzeal/gorequest"
 	"net/http"
@@ -38,11 +39,30 @@ UserAgent = [
 代理的策略 边测边验证的方式先验证再循环的循环模式
 */
 
+var ua = []string{"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
+	"Mozilla/5.0 (Windows; U; Windows NT 5.2) AppleWebKit/525.13 (KHTML, like Gecko) Version/3.1 Safari/525.13",
+	"Opera/9.27 (Windows NT 5.2; U; zh-cn)",
+}
+
+var ualen int = len(ua)
+
 type ProxyPool struct {
-	avaitems []string
-	index    int
-	allitems []string
-	lock     sync.Mutex
+	urls        []string
+	urlindex    int
+	uaindex     int
+	tryindex    int
+	trymax      int
+	lock        sync.Mutex
+	addurl      chan string
+	delurl      chan string
+	getproxy    chan proxyInfo
+	fetchnotify chan bool
+	num         int
+}
+
+type proxyInfo struct {
+	url string
+	ua  string
 }
 
 func genProxyUrl(kind, ip, port string) string {
@@ -53,39 +73,56 @@ func genProxyUrl(kind, ip, port string) string {
 	return "http://" + ip + ":" + port
 }
 
-func New() *ProxyPool {
-	var pool *ProxyPool
-	user := "root"
-	psword := "dbstar"
-	ipport := "localhost:3306"
-	dbname := "ippool"
-	para := user + ":" + psword + "@tcp" + "(" + ipport + ")" + "/" + dbname + "?charset=utf8&parseTime=True"
+func New(trymax int) *ProxyPool {
+	pool := New(ProxyPool)
 
-	db, err := sql.Open("mysql", para)
-	if err != nil {
-		return pool
-	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT IP, PORT,TYPE FROM xici_ip")
-	if err != nil {
-		return pool
-	}
-
-	pool = new(ProxyPool)
-	pool.index = 0
-
-	for rows.Next() {
-		var ipaddr, port, kind string
-		err := rows.Scan(ipaddr, port, kind)
-		if err != nil {
-			pool.allitems = append(pool.allitems, genProxyUrl(kind, ip, port))
-		}
-	}
-
-	// 从数据库中获取所有数据，占用内存不会大大
+	pool.trymax = trymax
+	pool.addurl = make(chan string)
+	pool.delurl = make(chan string)
+	pool.fetchnotify = make(chan bool)
 
 	return pool
+}
+
+func (self *ProxyPool) dispatch()
+
+func (self *ProxyPool) run() {
+
+	go func() {
+		for {
+			select {
+			case url := <-self.addurl:
+				{
+					append(self.urls, url)
+				}
+			case url := <-self.delurl:
+				{
+					// del invalid  url
+
+				}
+			case <-time.After(360 * time.Second):
+				{
+					if len(self.urls) < 100 {
+
+					}
+				}
+			default:
+				{
+					if self.urlindex == len(self.urls) {
+						self.urlindex = 0
+					}
+					for urli := self.urlindex; urli < len(self.urls); urli++ {
+						if self.uaindex == ualen {
+							self.uaindex = 0
+						}
+
+					}
+
+				}
+			}
+		}
+	}()
+
 }
 
 func (self *ProxyPool) getProxyUrl() string {
@@ -119,7 +156,7 @@ func (self *ProxyPool) ProxyGet(url string) (http.Response, error) {
 		proxyurl := self.getProxyUrl()
 		if proxyurl == "" {
 			// 通知获取goroutine去更新
-			time.Sleep(3600 * time.Second)
+			time.Sleep(360 * time.Second)
 
 		}
 		// 后续可以考虑Proxy复用，这样对GC友好
