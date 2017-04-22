@@ -1,11 +1,12 @@
 package xiciproxy
 
 import (
-	"database/sql"
 	"fmt"
-	"github.com/deckarep/golang-set"
+
+	"github.com/PuerkitoBio/goquery"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/parnurzeal/gorequest"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -47,17 +48,13 @@ var ua = []string{"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (
 var ualen int = len(ua)
 
 type ProxyPool struct {
-	urls        []string
-	urlindex    int
-	uaindex     int
-	tryindex    int
-	trymax      int
-	lock        sync.Mutex
-	addurl      chan string
-	delurl      chan string
-	getproxy    chan proxyInfo
-	fetchnotify chan bool
-	num         int
+	urls []string
+
+	lock     sync.Mutex
+	addurls  chan []string
+	delurl   chan string
+	getproxy chan *proxyInfo
+	cycles   int
 }
 
 type proxyInfo struct {
@@ -73,51 +70,102 @@ func genProxyUrl(kind, ip, port string) string {
 	return "http://" + ip + ":" + port
 }
 
-func New(trymax int) *ProxyPool {
-	pool := New(ProxyPool)
+func NewProxyPool() *ProxyPool {
+	pool := new(ProxyPool)
 
-	pool.trymax = trymax
-	pool.addurl = make(chan string)
+	pool.addurls = make(chan []string)
 	pool.delurl = make(chan string)
-	pool.fetchnotify = make(chan bool)
+	pool.urls = make([]string, 4096)
+	pool.getproxy = make(chan *proxyInfo, 32)
+	pool.run()
 
 	return pool
 }
 
-func (self *ProxyPool) dispatch()
+func (self *ProxyPool) fetch() {
+	url := "http://www.xicidaili.com/nn"
+	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36"
+	request := gorequest.New()
+	resp, _, errs := request.Get(url).Set("User-Agent", ua).End()
+	fmt.Println(resp)
+
+	fmt.Println(errs)
+
+	doc, err := goquery.NewDocumentFromResponse(resp)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(resp.Body)
+
+	/*
+	 <table id="ip_list">
+	*/
+	tables := doc.Find("table")
+	tableslen := tables.Length()
+	fmt.Println(tableslen)
+	for i := 0; i < tableslen; i++ {
+		table := tables.Eq(i)
+		idattr, ok := table.Attr("id")
+		fmt.Println(idattr, ok)
+		if ok == true {
+			trs := table.Find("tr")
+			trslen := trs.Length()
+			urls := make([]string, trslen)
+			for i := 1; i < trslen; i++ {
+				tr := trs.Eq(i)
+				tds := tr.Find("td")
+				kind := tds.Eq(5).Text()
+				ip := tds.Eq(1).Text()
+				port := tds.Eq(2).Text()
+				fmt.Println(kind)
+				fmt.Println(ip)
+				fmt.Println(port)
+				urls = append(urls, genProxyUrl(kind, ip, port))
+			}
+
+			self.addurls <- urls
+		}
+	}
+}
 
 func (self *ProxyPool) run() {
 
 	go func() {
 		for {
 			select {
-			case url := <-self.addurl:
+			case urls := <-self.addurls:
 				{
-					append(self.urls, url)
+					for _, url := range urls {
+						self.urls = append(self.urls, url)
+					}
 				}
 			case url := <-self.delurl:
 				{
 					// del invalid  url
+					for i := 0; i < len(self.urls); i++ {
+						if self.urls[i] == url {
+							copy(self.urls[i:], self.urls[i+1:])
+						}
+					}
 
 				}
-			case <-time.After(360 * time.Second):
+			case <-time.After(60 * time.Second):
 				{
+					self.cycles++
 					if len(self.urls) < 100 {
-
+						go self.fetch()
+					} else if self.cycles%60 == 0 {
+						go self.fetch()
 					}
 				}
+
 			default:
 				{
-					if self.urlindex == len(self.urls) {
-						self.urlindex = 0
-					}
-					for urli := self.urlindex; urli < len(self.urls); urli++ {
-						if self.uaindex == ualen {
-							self.uaindex = 0
-						}
-
-					}
-
+					urli := rand.Intn(len(self.urls))
+					uai := rand.Intn(ualen)
+					pinfo := &proxyInfo{url: self.urls[urli], ua: ua[uai]}
+					self.getproxy <- pinfo
 				}
 			}
 		}
@@ -125,45 +173,20 @@ func (self *ProxyPool) run() {
 
 }
 
-func (self *ProxyPool) getProxyUrl() string {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-	alllen := len(self.allitems)
-	if alllen > 0 {
-		tmp := self.allitems[alllen-1]
-		self.allitems = self.allitems[0 : alllen-1]
-		return tmp
-	}
-
-	avalen := len(self.avaitems)
-	if avalen > 0 {
-		if self.index == avalen {
-			self.index = 0
-		}
-		tmp := self.avaitems[self.index]
-		self.index++
-
-		return tmp
-	}
-
-	return ""
-
-}
-
 func (self *ProxyPool) ProxyGet(url string) (http.Response, error) {
 
 	for {
-		proxyurl := self.getProxyUrl()
-		if proxyurl == "" {
-			// 通知获取goroutine去更新
-			time.Sleep(360 * time.Second)
-
-		}
+		pinfo := <-self.getproxy
+		proxyurl := pinfo.url
+		uas := pinfo.ua
 		// 后续可以考虑Proxy复用，这样对GC友好
-		request := gorequest.New().Proxy(proxyurl)
-		resp, body, errs := request.Get(url).End()
+		request := gorequest.New().Proxy(proxyurl).Set("User-Agent", uas)
+		resp, _, errs := request.Get(url).End()
+		if errs == nil {
+			return http.Response(*resp), nil
+		}
 		fmt.Println(errs)
 		fmt.Println(resp)
-		fmt.Println(body)
+
 	}
 }
