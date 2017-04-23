@@ -9,7 +9,6 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -40,21 +39,18 @@ UserAgent = [
 代理的策略 边测边验证的方式先验证再循环的循环模式
 */
 
-var ua = []string{"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
+var uas = []string{"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
 	"Mozilla/5.0 (Windows; U; Windows NT 5.2) AppleWebKit/525.13 (KHTML, like Gecko) Version/3.1 Safari/525.13",
 	"Opera/9.27 (Windows NT 5.2; U; zh-cn)",
 }
 
-var ualen int = len(ua)
+var ualen int = len(uas)
 
 type ProxyPool struct {
-	urls []string
-
-	lock     sync.Mutex
+	urls     []string
 	addurls  chan []string
 	delurl   chan string
 	getproxy chan *proxyInfo
-	cycles   int
 }
 
 type proxyInfo struct {
@@ -73,10 +69,8 @@ func genProxyUrl(kind, ip, port string) string {
 func NewProxyPool() *ProxyPool {
 	pool := new(ProxyPool)
 
-	pool.addurls = make(chan []string)
-	pool.delurl = make(chan string)
-	pool.urls = make([]string, 4096)
 	pool.getproxy = make(chan *proxyInfo, 32)
+	pool.urls = make([]string, 0)
 	pool.run()
 
 	return pool
@@ -87,9 +81,11 @@ func (self *ProxyPool) fetch() {
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36"
 	request := gorequest.New()
 	resp, _, errs := request.Get(url).Set("User-Agent", ua).End()
-	fmt.Println(resp)
-
-	fmt.Println(errs)
+	//fmt.Println(resp)
+	if errs != nil {
+		fmt.Println(errs)
+		return
+	}
 
 	doc, err := goquery.NewDocumentFromResponse(resp)
 	if err != nil {
@@ -118,13 +114,14 @@ func (self *ProxyPool) fetch() {
 				kind := tds.Eq(5).Text()
 				ip := tds.Eq(1).Text()
 				port := tds.Eq(2).Text()
-				fmt.Println(kind)
-				fmt.Println(ip)
-				fmt.Println(port)
-				urls = append(urls, genProxyUrl(kind, ip, port))
+				j := i - 1
+				urls[j] = genProxyUrl(kind, ip, port)
 			}
-
+			fmt.Println("send urls")
+			//fmt.Println(urls)
 			self.addurls <- urls
+			break
+
 		}
 	}
 }
@@ -132,10 +129,27 @@ func (self *ProxyPool) fetch() {
 func (self *ProxyPool) run() {
 
 	go func() {
+
+		var temp proxyInfo
 		for {
+
+			if len(self.urls) < 50 {
+				go self.fetch()
+				<-time.After(3 * time.Second)
+			}
+
+			if len(self.urls) > 0 {
+				urli := rand.Intn(len(self.urls))
+				uai := rand.Intn(ualen)
+				temp.url = self.urls[urli]
+				temp.ua = uas[uai]
+			}
 			select {
+
 			case urls := <-self.addurls:
 				{
+					fmt.Println("recv addurls")
+					fmt.Println(urls)
 					for _, url := range urls {
 						self.urls = append(self.urls, url)
 					}
@@ -150,22 +164,14 @@ func (self *ProxyPool) run() {
 					}
 
 				}
-			case <-time.After(60 * time.Second):
+			case self.getproxy <- &temp:
 				{
-					self.cycles++
-					if len(self.urls) < 100 {
-						go self.fetch()
-					} else if self.cycles%60 == 0 {
-						go self.fetch()
-					}
+					//do nothing
 				}
-
-			default:
+			case <-time.After(10 * time.Second):
 				{
-					urli := rand.Intn(len(self.urls))
-					uai := rand.Intn(ualen)
-					pinfo := &proxyInfo{url: self.urls[urli], ua: ua[uai]}
-					self.getproxy <- pinfo
+					// time out
+					fmt.Println("urls len:", len(self.urls))
 				}
 			}
 		}
@@ -173,10 +179,11 @@ func (self *ProxyPool) run() {
 
 }
 
-func (self *ProxyPool) ProxyGet(url string) (http.Response, error) {
+func (self *ProxyPool) Get(url string) (http.Response, error) {
 
 	for {
 		pinfo := <-self.getproxy
+		fmt.Println(pinfo)
 		proxyurl := pinfo.url
 		uas := pinfo.ua
 		// 后续可以考虑Proxy复用，这样对GC友好
