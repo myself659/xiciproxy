@@ -41,21 +41,28 @@ UserAgent = [
 
 var uas = []string{"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
 	"Mozilla/5.0 (Windows; U; Windows NT 5.2) AppleWebKit/525.13 (KHTML, like Gecko) Version/3.1 Safari/525.13",
-	"Opera/9.27 (Windows NT 5.2; U; zh-cn)",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; WOW64; rv:53.0) Gecko/20100101 Firefox/53.0",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.246",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_2) AppleWebKit/601.3.9 (KHTML, like Gecko) Version/9.0.2 Safari/601.3.9",
+	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/47.0.2526.111 Safari/537.36",
+	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:15.0) Gecko/20100101 Firefox/15.0.1",
 }
 
 var ualen int = len(uas)
+
+type proxyInfo struct {
+	url string
+	ua  string
+}
 
 type ProxyPool struct {
 	urls     []string
 	addurls  chan []string
 	delurl   chan string
 	getproxy chan *proxyInfo
-}
-
-type proxyInfo struct {
-	url string
-	ua  string
+	cur      *proxyInfo
+	limit    int
 }
 
 func genProxyUrl(kind, ip, port string) string {
@@ -71,6 +78,9 @@ func NewProxyPool() *ProxyPool {
 
 	pool.getproxy = make(chan *proxyInfo, 32)
 	pool.urls = make([]string, 0)
+	pool.addurls = make(chan []string)
+	pool.delurl = make(chan string)
+	pool.limit = 0
 	pool.run()
 
 	return pool
@@ -81,7 +91,6 @@ func (self *ProxyPool) fetch() {
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36"
 	request := gorequest.New()
 	resp, _, errs := request.Get(url).Set("User-Agent", ua).End()
-	//fmt.Println(resp)
 	if errs != nil {
 		fmt.Println(errs)
 		return
@@ -92,18 +101,17 @@ func (self *ProxyPool) fetch() {
 		fmt.Println(err)
 		return
 	}
-	fmt.Println(resp.Body)
 
 	/*
 	 <table id="ip_list">
 	*/
 	tables := doc.Find("table")
 	tableslen := tables.Length()
-	fmt.Println(tableslen)
+	//fmt.Println(tableslen)
 	for i := 0; i < tableslen; i++ {
 		table := tables.Eq(i)
-		idattr, ok := table.Attr("id")
-		fmt.Println(idattr, ok)
+		_, ok := table.Attr("id")
+		//fmt.Println(idattr, ok)
 		if ok == true {
 			trs := table.Find("tr")
 			trslen := trs.Length()
@@ -148,8 +156,11 @@ func (self *ProxyPool) run() {
 
 			case urls := <-self.addurls:
 				{
-					fmt.Println("recv addurls")
-					fmt.Println(urls)
+
+					fmt.Println("recv addurls:", len(urls))
+					/*
+						fmt.Println(urls)
+					*/
 					for _, url := range urls {
 						self.urls = append(self.urls, url)
 					}
@@ -160,6 +171,8 @@ func (self *ProxyPool) run() {
 					for i := 0; i < len(self.urls); i++ {
 						if self.urls[i] == url {
 							copy(self.urls[i:], self.urls[i+1:])
+							self.urls = self.urls[:len(self.urls)-1]
+							//self.urls = append(self.urls[:i], self.urls[i+1:])
 						}
 					}
 
@@ -168,7 +181,7 @@ func (self *ProxyPool) run() {
 				{
 					//do nothing
 				}
-			case <-time.After(10 * time.Second):
+			case <-time.After(100 * time.Second):
 				{
 					// time out
 					fmt.Println("urls len:", len(self.urls))
@@ -179,21 +192,35 @@ func (self *ProxyPool) run() {
 
 }
 
-func (self *ProxyPool) Get(url string) (http.Response, error) {
-
+func (self *ProxyPool) Get(url string) (*http.Response, error) {
+	var proxyurl string
+	var uas string
 	for {
-		pinfo := <-self.getproxy
-		fmt.Println(pinfo)
-		proxyurl := pinfo.url
-		uas := pinfo.ua
+		if self.limit <= 0 {
+			pinfo := <-self.getproxy
+			proxyurl = pinfo.url
+			uas = pinfo.ua
+			self.cur = pinfo
+			self.limit = 60
+		} else {
+			proxyurl = self.cur.url
+			uas = self.cur.ua
+		}
+		//fmt.Println(pinfo)
+
 		// 后续可以考虑Proxy复用，这样对GC友好
-		request := gorequest.New().Proxy(proxyurl).Set("User-Agent", uas)
+		request := gorequest.New().Proxy(proxyurl).Set("User-Agent", uas).Timeout(60 * time.Second)
 		resp, _, errs := request.Get(url).End()
 		if errs == nil {
-			return http.Response(*resp), nil
+			self.limit--
+			return resp, nil
 		}
-		fmt.Println(errs)
-		fmt.Println(resp)
+		fmt.Println(url, errs)
+		// 有效提高速度,一定要将害群之马清除
+		self.delurl <- proxyurl
+		//fmt.Println(resp)
+		self.limit = 0
 
 	}
 }
+
